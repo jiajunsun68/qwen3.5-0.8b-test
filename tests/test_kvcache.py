@@ -1,4 +1,4 @@
-# 验证kv cache
+# 验证kv cache, 即增加一个 token 后，前几个 token 在第一层的输出（即第二层的输入）数值完全相同。
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
