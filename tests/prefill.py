@@ -42,7 +42,7 @@ class GenerationWorker(QObject):
 		device: torch.device,
 		past_key_values: object,
 		logits: torch.Tensor,
-		max_new_tokens: int = 64,
+		max_new_tokens: int = 1024,
 	) -> None:
 		super().__init__()
 		self.model = model
@@ -100,6 +100,7 @@ class TokenWorkbench(QWidget):
 		self._generation_worker: GenerationWorker | None = None
 		self._chat_events: list[str] = []
 		self._conversation_messages: list[dict[str, str]] = []
+		self._draft_token_ids: list[int] = []
 		self._committed_token_ids: list[int] = []
 		self._draft_user_text: str = ""
 		self._state_stack: list[tuple[object, torch.Tensor]] = []
@@ -248,12 +249,13 @@ class TokenWorkbench(QWidget):
 			)
 			self.model.to(self.device)
 			self.model.eval()
-			self._prime_with_system_prompt()
-			self._append_event("系统模型已加载")
 			self._conversation_messages = [
 				{"role": "system", "content": SYSTEM_PROMPT},
 			]
+			self._draft_token_ids = []
 			self._draft_user_text = ""
+			self._rebuild_draft_state()
+			self._append_event("系统模型已加载")
 			self._refresh_views()
 		except Exception as exc:  # pragma: no cover - UI error path
 			self._load_error = str(exc)
@@ -264,9 +266,35 @@ class TokenWorkbench(QWidget):
 			self._refresh_views()
 			QMessageBox.critical(self, "加载失败", f"无法加载模型：\n{exc}")
 
-	def _prime_with_system_prompt(self) -> None:
+	def _prompt_history_messages(self) -> list[dict[str, str]]:
+		messages = list(self._conversation_messages)
+		if messages and messages[-1]["role"] == "assistant" and messages[-1]["content"] == "生成中...":
+			messages = messages[:-1]
+		return messages
+
+	def _build_open_user_prompt_text(self) -> str:
+		messages = self._prompt_history_messages()
+		if messages and messages[0]["role"] == "system":
+			system_content = messages[0]["content"]
+			base_prompt = f"<|im_start|>system\n{system_content}<|im_end|>\n"
+		else:
+			base_prompt = ""
+		return base_prompt + "<|im_start|>user\n" + self._draft_user_text
+
+	def _build_generation_prompt_text(self) -> str:
+		messages = self._prompt_history_messages()
+		return self.tokenizer.apply_chat_template(
+			messages,
+			tokenize=False,
+			add_generation_prompt=True,
+		)
+
+	def _rebuild_draft_state(self) -> None:
+		if self._load_error is not None:
+			return
+		prompt_text = self._build_open_user_prompt_text()
 		encoded = self.tokenizer(
-			SYSTEM_PROMPT,
+			prompt_text,
 			add_special_tokens=False,
 			return_tensors="pt",
 		)
@@ -275,6 +303,25 @@ class TokenWorkbench(QWidget):
 			outputs = self.model(input_ids=input_ids, use_cache=True)
 		self._state_stack = [(outputs.past_key_values, outputs.logits[:, -1, :].detach())]
 		self._committed_token_ids = list(encoded["input_ids"][0].tolist())
+
+	def _rebuild_generation_state(self) -> None:
+		prompt_text = self._build_generation_prompt_text()
+		encoded = self.tokenizer(
+			prompt_text,
+			add_special_tokens=False,
+			return_tensors="pt",
+		)
+		input_ids = encoded["input_ids"].to(self.device)
+		with torch.no_grad():
+			outputs = self.model(input_ids=input_ids, use_cache=True)
+		self._state_stack = [(outputs.past_key_values, outputs.logits[:, -1, :].detach())]
+		self._committed_token_ids = list(encoded["input_ids"][0].tolist())
+
+	def _release_kv_cache(self) -> None:
+		self._state_stack.clear()
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 
 	def closeEvent(self, event) -> None:
 		if self._generation_worker is not None:
@@ -288,10 +335,12 @@ class TokenWorkbench(QWidget):
 		except Exception:
 			pass
 		self._state_stack.clear()
+		self._draft_token_ids.clear()
 		self._committed_token_ids.clear()
 		self._conversation_messages.clear()
 		self._chat_events.clear()
 		del self._state_stack
+		del self._draft_token_ids
 		del self._committed_token_ids
 		del self._conversation_messages
 		del self._chat_events
@@ -349,19 +398,8 @@ class TokenWorkbench(QWidget):
 			return token_ids, offsets
 
 	def _commit_token(self, token_id: int, token_text: str) -> None:
-		if not self._state_stack:
-			raise RuntimeError("模型状态未初始化")
-		past_key_values = self._state_stack[-1][0]
-		input_ids = torch.tensor([[token_id]], device=self.device)
-		with torch.no_grad():
-			outputs = self.model(
-				input_ids=input_ids,
-				past_key_values=past_key_values,
-				use_cache=True,
-			)
-		next_logits = outputs.logits[:, -1, :].detach()
-		self._state_stack.append((outputs.past_key_values, next_logits))
-		self._committed_token_ids.append(token_id)
+		self._draft_token_ids.append(token_id)
+		self._draft_user_text += token_text
 		self._append_event(f"提交 token: {html.escape(token_text)}")
 
 	def _process_pending_text(self, current_text: str | None = None) -> None:
@@ -369,6 +407,7 @@ class TokenWorkbench(QWidget):
 			return
 		remaining = self.input_edit.text() if current_text is None else current_text
 		if not remaining:
+			self._rebuild_draft_state()
 			self._refresh_views()
 			return
 		updated = False
@@ -382,23 +421,25 @@ class TokenWorkbench(QWidget):
 			token_id = token_ids[0]
 			token_text = remaining[start:end]
 			self._commit_token(token_id, token_text)
-			self._draft_user_text += token_text
 			remaining = remaining[end:]
 			updated = True
 		if updated and remaining != self.input_edit.text():
 			self._set_input_text(remaining, process=False)
+		if updated:
+			self._rebuild_draft_state()
 		self._refresh_views()
 
 	def _rollback_last_token(self) -> None:
-		if len(self._state_stack) <= 1:
+		if not self._draft_token_ids:
 			return
-		removed_token_id = self._committed_token_ids.pop()
-		self._state_stack.pop()
+		removed_token_id = self._draft_token_ids.pop()
 		removed_text = self._decode_token_for_display(removed_token_id)
 		if self._draft_user_text.endswith(removed_text):
 			self._draft_user_text = self._draft_user_text[: -len(removed_text)]
 		self._set_input_text(removed_text + self.input_edit.text(), process=False)
 		self._append_event(f"回退 token: {html.escape(removed_text)}")
+		self._release_kv_cache()
+		self._rebuild_draft_state()
 		self._refresh_views()
 
 	def _set_input_text(self, text: str, process: bool = True) -> None:
@@ -420,11 +461,10 @@ class TokenWorkbench(QWidget):
 		message = self._draft_user_text + pending_text
 		if not message.strip() or self._load_error is not None:
 			return
-		if pending_text:
-			self._commit_text_to_state(pending_text)
 		self._add_message("user", message)
 		self._append_event(f"发送 user: {html.escape(message)}")
 		self._set_input_text("", process=False)
+		self._draft_token_ids.clear()
 		self._draft_user_text = ""
 		self._refresh_views()
 		self._add_message("assistant", "生成中...")
@@ -441,6 +481,7 @@ class TokenWorkbench(QWidget):
 			return
 		self._generation_active = True
 		self._set_input_controls_enabled(False)
+		self._rebuild_generation_state()
 		prompt_cache, prompt_logits = self._state_stack[-1]
 		self._generation_thread = QThread(self)
 		self._generation_worker = GenerationWorker(
@@ -513,6 +554,7 @@ class TokenWorkbench(QWidget):
 	def _commit_text_to_state(self, text: str) -> None:
 		for token_id in self.tokenizer.encode(text, add_special_tokens=False):
 			self._commit_token(token_id, self._decode_token_for_display(token_id))
+		self._rebuild_draft_state()
 
 	# Rendering
 	def _render_top7_logits(self) -> str:
