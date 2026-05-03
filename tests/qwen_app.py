@@ -10,8 +10,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 
-MODEL_DIR = Path(__file__).resolve().parents[1] / "qwen"
-SYSTEM_PROMPT = "你是一个智能助手，名叫傻妞。我叫小智。请用友好、热情的语气回答我的问题。"
+MODEL_DIR = Path(__file__).resolve().parents[1] / "qwen_output_sft"
+SYSTEM_PROMPT = "你是一个智能助手，名叫傻妞。我叫小智。"
 
 
 def load_model() -> tuple[AutoTokenizer, AutoModelForCausalLM, torch.device]:
